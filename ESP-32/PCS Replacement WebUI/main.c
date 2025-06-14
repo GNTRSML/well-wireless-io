@@ -7,13 +7,12 @@
 
 static bool addpeer = false;
 
-int mode = 0;//Change this to set STA/TX/SLAVE=1 or AP/RX/MASTER=0
+int mode;//Change this to set STA/TX/SLAVE=1 or AP/RX/MASTER=0
 
 uint8_t PEER_MAC[6];//Stores MAC address of peer
 
 Data g_data;
 returnData g_returndata;
-lastTxtime g_txtime;
 
 //Callback function for when data is sent and acknowledged
 void staSendCB(const uint8_t *mac_addr, esp_now_send_status_t status){
@@ -70,10 +69,10 @@ void apRecvCB(const esp_now_recv_info_t *esp_now_recv_info, const uint8_t *incom
 //Send Data Task, MUST NOT RETURN(infinite loop) MODE = 1
 void sendData(void *pvParameter){
     while(1){
-        g_data.plunger_state = gpio_get_level(18);
-        g_data.solenoid_state = gpio_get_level(19);
+        g_data.plunger_state = gpio_get_level(19);
+        g_data.solenoid_state = gpio_get_level(18);
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_now_send(PEER_MAC, (uint8_t *) &g_data, sizeof(g_data)));
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 }
 
@@ -93,7 +92,23 @@ void apProcessing(){//Process the recieved data for AP
     }
 }
 
+void apPinUDP(void *pvParameter){
+    while(1){
+        g_returndata.meter_state = gpio_get_level(18);
+        g_returndata.relay_state = gpio_get_level(19);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(){
+    gpio_config_t modeset = {
+            .pin_bit_mask = (1ULL<<21),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE
+        };
+    gpio_config(&modeset);
+    mode = gpio_get_level(21);
     //Initialize flash memory and WIFI for ESPNOW Communication
     esp_err_t nvserr = nvs_flash_init();
     if(nvserr == ESP_ERR_NVS_NO_FREE_PAGES || nvserr == ESP_ERR_NVS_NEW_VERSION_FOUND){
@@ -125,14 +140,29 @@ void app_main(){
     
     //Scan for nearby AP and grab MAC Address, only runs if TX/STA
     if(mode == 1){
+        rescan:
         wifi_scan_config_t scan_config = {.ssid = 0, .bssid = 0, .channel = 0, .show_hidden = true};
         esp_wifi_scan_start(&scan_config, true);
-        wifi_ap_record_t wifi_records;
-        esp_wifi_scan_get_ap_record(&wifi_records);
-        memcpy(PEER_MAC, wifi_records.bssid, 6);
-        printf("%32s  ", (char *)wifi_records.ssid);
-        printf("%4d  ", wifi_records.rssi);
-        printf("%02x;%02x;%02x;%02x;%02x;%02x\n", PEER_MAC[0], PEER_MAC[1], PEER_MAC[2], PEER_MAC[3], PEER_MAC[4], PEER_MAC[5]);
+        wifi_ap_record_t wifi_records[4];
+        uint16_t max_records = 4; 
+        esp_wifi_scan_get_ap_records(&max_records, wifi_records);
+        for(int i = 0;i <= max_records;i++){
+            char *ssids = (char *)wifi_records[i].ssid;
+            char *wantedssid = "ESP";
+            char *result = strstr(ssids, wantedssid);
+            printf("%32s\n", (char *)wifi_records[i].ssid);
+            if(result != NULL){
+                memcpy(PEER_MAC, wifi_records[i].bssid, 6);
+                printf("Found ESP Device\n");
+                printf("%4d  ", wifi_records[i].rssi);
+                printf("%02x;%02x;%02x;%02x;%02x;%02x\n", PEER_MAC[0], PEER_MAC[1], PEER_MAC[2], PEER_MAC[3], PEER_MAC[4], PEER_MAC[5]);
+                break;
+            }else if(result == NULL && i >= max_records){
+                i = 0;
+                printf("ESP Network Not Found\n");
+                goto rescan;
+            }
+        }
         esp_now_peer_info_t peerInfo;
         memcpy(peerInfo.peer_addr, PEER_MAC, 6);
         peerInfo.ifidx = WIFI_IF_STA;
@@ -149,7 +179,7 @@ void app_main(){
     //Inputs/Outputs setup
     if(mode == 1){
         gpio_config_t plunger = {
-            .pin_bit_mask = (1ULL<<18),
+            .pin_bit_mask = (1ULL<<19),
             .mode = GPIO_MODE_INPUT,
             .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE 
@@ -157,7 +187,7 @@ void app_main(){
         gpio_config(&plunger);
 
         gpio_config_t solenoid = {
-            .pin_bit_mask = (1ULL<<19),
+            .pin_bit_mask = (1ULL<<18),
             .mode = GPIO_MODE_OUTPUT,
             .pull_up_en = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE
@@ -191,6 +221,7 @@ void app_main(){
     }else if(mode == 0){
         esp_now_register_send_cb(apSendCB);
         esp_now_register_recv_cb(apRecvCB);
+        xTaskCreate(&apPinUDP, "Pin_Update", 2048, NULL, 5, NULL);
     }
     printf("Startup Done\n");
     
